@@ -575,8 +575,12 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     private void layoutButtons() {
         int w = Gdx.graphics.getWidth(), h = Gdx.graphics.getHeight();
-        rSound.set(16, 16, 150, 60);
-        rReset.set(176, 16, 130, 60);
+        // v1.0.2: tombol SUARA dilebarkan (label "SUARA: OFF" skala font 2
+        // meluber keluar kotak 150px dan menumpuk label RESET — terlihat di
+        // screenshot user sebagai "SUARA: ONRESET"); RESET digeser ke kanan
+        // dengan jarak jelas.
+        rSound.set(16, 16, 230, 60);
+        rReset.set(256, 16, 130, 60);
         rGas.set(w - 240, h - 170, 200, 130);
         rRem.set(w - 460, h - 170, 190, 130);
         rJump.set(w - 240, h - 330, 200, 110);
@@ -813,6 +817,13 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 camTargetS.y + sp * camDistS,
                 camTargetS.z + MathUtils.cos(camYawS) * cp * camDistS);
         if (cam.position.y < 0.6f) cam.position.y = 0.6f; // jangan tembus tanah
+        // JAMINAN ANTI-ROLL (v1.0.2): up vector DI-RESET ke (0,1,0) SETIAP frame
+        // sebelum lookAt. Posisi kamera dihitung murni dari koordinat bola
+        // (yaw/pitch/jarak) dan orientasi HANYA dari lookAt — objek kamera
+        // TIDAK PERNAH dirotasi (tanpa camera.rotate/rotateAround di mana pun).
+        // Dengan up tegak, Matrix4.setToLookAt membangun sumbu-X horizontal
+        // sehingga horizon SELALU datar — roll tidak mungkin terjadi.
+        cam.up.set(0f, 1f, 0f);
         cam.lookAt(camTargetS);
         cam.update();
     }
