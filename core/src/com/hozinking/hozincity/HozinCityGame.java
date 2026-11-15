@@ -318,10 +318,11 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 float distC = (float) Math.sqrt(cx * cx + cz * cz);
                 float hBase = 8f + (1f - Math.min(distC / 130f, 1f)) * 20f;
                 if ((bx + bz) % 2 == 0) {
-                    // 1 gedung besar
-                    float w = 15f + rng.nextFloat() * 3f, d = 15f + rng.nextFloat() * 3f;
+                    // 1 gedung besar + 1 annex kecil di sudut blok
+                    float w = 13f + rng.nextFloat() * 2f, d = 13f + rng.nextFloat() * 2f;
                     float h = hBase + rng.nextFloat() * 6f;
                     addBuilding(p, roof, cx, cz, w, h, d);
+                    addBuilding(p, roof, cx - 11f, cz - 11f, 6f, 5f + rng.nextFloat() * 2f, 6f);
                 } else {
                     // 2 gedung kecil berdampingan
                     for (int k = 0; k < 2; k++) {
