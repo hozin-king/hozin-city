@@ -35,8 +35,10 @@ import java.util.HashMap;
 import java.util.Random;
 
 /**
- * Hozin City v1.0 — mini open-world ala GTA SA (libGDX 3D).
+ * Hozin City v1.0.1 — mini open-world ala GTA SA (libGDX 3D).
  * Satu distrik kota: jalan kaki + nyetir + pejalan kaki + koin + minimap.
+ * v1.0.1: kamera third-person diperbaiki total (smoothing + tanpa auto-follow
+ * saat jalan kaki + arah drag pitch konvensi orbit + pinch halus + zoom 4-14).
  * Optimasi: geometri statis digabung jadi sedikit mesh besar, satu directional
  * light + ambient, blob shadow murah (tanpa shadow map), fixed timestep 60 Hz,
  * frustum culling manual untuk objek dinamis, tanpa alokasi per-frame.
@@ -111,12 +113,21 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     // ---------- tabrakan gedung ----------
     private final Array<Rectangle> buildingBoxes = new Array<>();
 
-    // ---------- kamera ----------
-    private float camYaw = (float) Math.PI; // di belakang pemain (pemain menghadap +Z awal? lihat create)
-    private float camPitch = 0.42f;
-    private float camDist = 10f;
+    // ---------- kamera (third-person ala GTA, v1.0.1) ----------
+    // camYaw/camPitch/camDist = nilai TARGET (diatur drag/pinch).
+    // camYawS/camPitchS/camDistS/camTargetS = nilai TERHALUS (yang dirender) —
+    // di-lerp menuju target tiap frame supaya kamera tidak snap/kaku.
+    // v1.0 TIDAK punya smoothing ini + auto-follow merampas kamera saat jalan
+    // (itu sumber "rusak/aneh"); di v1.0.1 auto-follow HANYA saat nyetir kencang.
+    private float camYaw = (float) Math.PI; // target yaw (di belakang pemain)
+    private float camPitch = 0.42f;         // target pitch, rad
+    private float camDist = 8f;             // target jarak
+    private float camYawS = (float) Math.PI;
+    private float camPitchS = 0.42f;
+    private float camDistS = 8f;
     private float dragPause = 0f;
     private final Vector3 camTarget = new Vector3();
+    private final Vector3 camTargetS = new Vector3(0, 1.2f, 20);
 
     // ---------- input ----------
     private int joyId = -1, camId = -1, pinchId = -1;
@@ -618,9 +629,10 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     private void updatePlayer(float dt, float joyLen) {
         if (joyLen > 0.08f) {
-            // gerak relatif terhadap kamera
-            float fx = -MathUtils.sin(camYaw), fz = -MathUtils.cos(camYaw);
-            float rx = MathUtils.cos(camYaw), rz = -MathUtils.sin(camYaw);
+            // Gerak relatif terhadap arah kamera YANG TERLIHAT (yaw terhalus),
+            // bukan yaw target — supaya arah joystick selalu cocok dengan layar.
+            float fx = -MathUtils.sin(camYawS), fz = -MathUtils.cos(camYawS);
+            float rx = MathUtils.cos(camYawS), rz = -MathUtils.sin(camYawS);
             float mx = rx * joyX + fx * joyY;
             float mz = rz * joyX + fz * joyY;
             float len = (float) Math.sqrt(mx * mx + mz * mz);
@@ -775,20 +787,33 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     private void updateCamera(float dt) {
         Vector3 target = driving && currentCar != null ? currentCar.pos : pPos;
-        camTarget.set(target.x, target.y + 1.2f, target.z);
         float heading = driving && currentCar != null ? currentCar.heading : pHeading;
-        boolean moving = driving ? Math.abs(currentCar.speed) > 0.5f
-                : (joyX * joyX + joyY * joyY) > 0.01f;
-        if (moving && dragPause <= 0f) {
-            float targetYaw = heading + MathUtils.PI;
-            camYaw = lerpAngle(camYaw, targetYaw, 1f - (float) Math.exp(-2.2f * dt));
+        // lookAt: kepala target + sedikit ke depan arah geraknya.
+        camTarget.set(target.x + MathUtils.sin(heading) * 0.8f,
+                target.y + 1.4f,
+                target.z + MathUtils.cos(heading) * 0.8f);
+        // Auto-center HANYA saat nyetir kencang dan user tidak baru saja drag
+        // (ala GTA: kamera kembali ke belakang mobil saat ngebut, pelan 1.5/dtk).
+        // Saat jalan kaki kamera TIDAK PERNAH dirampas — di v1.0 inilah yang
+        // bikin kamera terasa "rusak/aneh" (berayun 180° saat jalan mundur).
+        if (driving && currentCar != null && Math.abs(currentCar.speed) > 6f && dragPause <= 0f) {
+            camYaw = lerpAngle(camYaw, heading + MathUtils.PI, 1f - (float) Math.exp(-1.5f * dt));
         }
-        float cp = MathUtils.cos(camPitch), sp = MathUtils.sin(camPitch);
+        // Smoothing: semua nilai render menuju target (~9/dtk; posisi target 12/dtk
+        // supaya tidak ketinggalan saat lari).
+        float k = 1f - (float) Math.exp(-9f * dt);
+        float kPos = 1f - (float) Math.exp(-12f * dt);
+        camTargetS.lerp(camTarget, kPos);
+        camYawS = lerpAngle(camYawS, camYaw, k);
+        camPitchS += (camPitch - camPitchS) * k;
+        camDistS += (camDist - camDistS) * k;
+        float cp = MathUtils.cos(camPitchS), sp = MathUtils.sin(camPitchS);
         cam.position.set(
-                camTarget.x + MathUtils.sin(camYaw) * cp * camDist,
-                camTarget.y + sp * camDist,
-                camTarget.z + MathUtils.cos(camYaw) * cp * camDist);
-        cam.lookAt(camTarget);
+                camTargetS.x + MathUtils.sin(camYawS) * cp * camDistS,
+                camTargetS.y + sp * camDistS,
+                camTargetS.z + MathUtils.cos(camYawS) * cp * camDistS);
+        if (cam.position.y < 0.6f) cam.position.y = 0.6f; // jangan tembus tanah
+        cam.lookAt(camTargetS);
         cam.update();
     }
 
@@ -1073,7 +1098,10 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 return true;
             }
         }
-        if (x < Gdx.graphics.getWidth() * 0.42f && joyId == -1) {
+        // Joystick hanya untuk sentuhan PERTAMA (tidak ada sentuhan lain aktif) —
+        // v1.0: jari kedua yang mendarat di kiri merebut joystick sehingga pinch
+        // tidak pernah terdaftar.
+        if (x < Gdx.graphics.getWidth() * 0.42f && joyId == -1 && camId == -1 && pinchId == -1) {
             joyId = pointer;
             updateJoy(x, y);
             return true;
@@ -1107,17 +1135,21 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
             float d = (float) Math.sqrt((x - camLastX) * (x - camLastX)
                     + (y - camLastY) * (y - camLastY));
             if (pinchLastDist > 1f && d > 1f) {
-                camDist = MathUtils.clamp(camDist * pinchLastDist / d, 6f, 16f);
+                // Target jarak (bukan langsung) — zoom ikut dihaluskan di updateCamera.
+                camDist = MathUtils.clamp(camDist * pinchLastDist / d, 4f, 14f);
             }
             pinchLastDist = d;
             return true;
         }
         if (pointer == camId && pinchId == -1) {
-            camYaw -= (x - camLastX) * 0.005f;
-            camPitch = MathUtils.clamp(camPitch + (y - camLastY) * 0.004f, 0.15f, 1.0f);
+            camYaw -= (x - camLastX) * 0.005f; // geser kanan = pandangan belok kanan
+            // Konvensi orbit (ala Genshin/GTA mobile): geser ke atas = kamera naik
+            // (lihat ke bawah); geser ke bawah = kamera turun (lihat ke atas).
+            // v1.0 memakai arah sebaliknya (konvensi FPS) — terasa aneh di kamera orbit.
+            camPitch = MathUtils.clamp(camPitch - (y - camLastY) * 0.004f, -0.087f, 0.96f);
             camLastX = x;
             camLastY = y;
-            dragPause = 1.2f;
+            dragPause = 2.5f;
             return true;
         }
         if (pointer == camId && pinchId != -1) {
@@ -1157,7 +1189,9 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         currentCar = c;
         driving = true;
         c.speed = 0;
-        camYaw = c.heading + MathUtils.PI;
+        // v1.0 men-snap camYaw ke belakang mobil di sini (jump cut). v1.0.1: kamera
+        // dibiarkan di tempatnya; auto-center lembut di updateCamera yang mengurus
+        // saat mobil sudah ngebut.
         tapSound();
     }
 
