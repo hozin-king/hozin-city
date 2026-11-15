@@ -2,6 +2,7 @@ package com.hozinking.hozincity;
 
 import com.badlogic.gdx.ApplicationAdapter;
 import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.Input;
 import com.badlogic.gdx.InputProcessor;
 import com.badlogic.gdx.Preferences;
 import com.badlogic.gdx.audio.Sound;
@@ -35,21 +36,32 @@ import java.util.HashMap;
 import java.util.Random;
 
 /**
- * Hozin City v1.0.3 — mini open-world ala GTA SA (libGDX 3D).
- * Satu distrik kota: jalan kaki + nyetir + pejalan kaki + koin + minimap.
+ * Hozin City v1.1.0 — mini open-world ala GTA SA (libGDX 3D).
+ * v1.1: map 400x400 + peta fullscreen (tap minimap, dunia pause) + traffic
+ * 8 mobil NPC + NPC 12 + tanah berbukit (jalan tetap datar) + 3 gedung bisa
+ * dimasukin (TOKO/RUMAH/BENGKEL, interior di bawah map) + koin 15.
  * v1.0.3: arah setir DIPERBAIKI (dulu terbalik: joystick kanan = belok kiri;
- * bukti vektor di updateCar). Audit semua pemetaan arah lain: jalan kaki,
- * drag kamera yaw/pitch, pinch zoom, minimap, GAS/REM — semuanya SUDAH benar.
- * Optimasi: geometri statis digabung jadi sedikit mesh besar, satu directional
- * light + ambient, blob shadow murah (tanpa shadow map), fixed timestep 60 Hz,
- * frustum culling manual untuk objek dinamis, tanpa alokasi per-frame.
+ * bukti vektor di updateCar). Optimasi: geometri statis digabung jadi sedikit
+ * mesh besar, satu directional light + ambient, blob shadow murah (tanpa
+ * shadow map), fixed timestep 60 Hz, frustum culling manual untuk objek
+ * dinamis, tanpa alokasi per-frame.
  */
 public class HozinCityGame extends ApplicationAdapter implements InputProcessor {
     // ---------- konstanta kota ----------
-    private static final float WORLD = 240f;          // tanah 240x240
-    private static final float HALF = WORLD / 2f;     // 120
-    private static final float[] ROADS = {-80f, -40f, 0f, 40f, 80f};
+    private static final float WORLD = 400f;          // tanah 400x400 (v1.1)
+    private static final float HALF = WORLD / 2f;     // 200
+    private static final float[] ROADS = {-160f, -120f, -80f, -40f, 0f, 40f, 80f, 120f, 160f};
     private static final float ROAD_W = 10f;
+    // Bukit lembut: {cx, cz, radius, tinggi}. Hanya di blok taman/bukit —
+    // radius < jarak ke jalan terdekat (20) sehingga JALAN tetap datar.
+    private static final float[][] HILLS = {
+            {20f, 20f, 13f, 3.0f},      // taman tengah
+            {-180f, -180f, 14f, 4.5f},  // bukit pinggir barat-daya
+            {140f, -140f, 12f, 2.5f},   // bukit timur
+    };
+    // Gedung yang bisa dimasukin: {cx, cz, tipe} — 0=TOKO, 1=RUMAH, 2=BENGKEL.
+    private static final float[][] ENTER_SPOTS = {{20f, -20f, 0f}, {-20f, 20f, 1f}, {-20f, -20f, 2f}};
+    private static final String[] ENTER_NAMES = {"TOKO", "RUMAH", "BENGKEL"};
     private static final float STEP = 1f / 60f;       // fixed timestep
 
     // ---------- render ----------
@@ -114,6 +126,42 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     // ---------- tabrakan gedung ----------
     private final Array<Rectangle> buildingBoxes = new Array<>();
 
+    // ---------- traffic (mobil NPC, ambient — tidak bisa dimasukin) ----------
+    private static class TrafficCar {
+        final Vector3 pos = new Vector3();
+        float heading, speed, targetSpeed;
+        float tx, tz;       // titik target (persimpangan + offset lajur kanan)
+        float ix, iz;       // persimpangan target (tanpa offset)
+        float dirX, dirZ;   // arah jalan saat ini (sumbu grid)
+        ModelInstance inst;
+    }
+    private final Array<TrafficCar> traffic = new Array<>();
+
+    // ---------- gedung yang bisa dimasukin ----------
+    private static class Enterable {
+        String name;
+        int type; // 0=TOKO, 1=RUMAH, 2=BENGKEL
+        final Vector3 door = new Vector3(); // posisi di depan pintu (kota)
+        float bx, bz; // pusat gedung
+    }
+    private final Array<Enterable> enterables = new Array<>();
+
+    private static class Room {
+        String name;
+        ModelInstance inst;
+        final Vector3 center = new Vector3(); // (rx, -60, 0)
+        final Array<Rectangle> furn = new Array<>(); // kotak tabrakan furnitur
+        final Vector3 exitDoor = new Vector3(); // posisi pintu keluar (di dalam)
+    }
+    private final Array<Room> rooms = new Array<>();
+    private boolean inInterior;
+    private int curRoom;
+    private Enterable curEnterable;
+
+    // ---------- peta fullscreen ----------
+    private boolean mapOpen; // true = peta terbuka, dunia di-PAUSE
+    private final Rectangle rMapClose = new Rectangle();
+
     // ---------- kamera (third-person ala GTA, v1.0.1) ----------
     // camYaw/camPitch/camDist = nilai TARGET (diatur drag/pinch).
     // camYawS/camPitchS/camDistS/camTargetS = nilai TERHALUS (yang dirender) —
@@ -159,6 +207,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     private float time;
     private final Vector3 tmp = new Vector3();
     private final Vector3 tmp2 = new Vector3();
+    private final Vector3 tmpN = new Vector3(); // normal grid tanah (per quad)
     private final Matrix4 tmpM = new Matrix4();
     private final Random rng = new Random(7);
     private String hudCoins = "KOIN: 0/10";
@@ -201,10 +250,13 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         buildCity();
         buildPlayer();
         buildCars();
+        buildTraffic();
         buildNpcs();
         buildCoins();
+        buildInteriors();
         layoutButtons();
         Gdx.input.setInputProcessor(this);
+        Gdx.input.setCatchBackKey(true); // tombol BACK menutup peta fullscreen
         updateHudText();
     }
 
@@ -257,33 +309,75 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         return mi;
     }
 
+    // ================= BUKIT (heightmap) =================
+
+    /** Tinggi tanah di (x,z): 0 di jalan/trotoar, naik halus di zona bukit. */
+    private static float heightAt(float x, float z) {
+        float h = 0f;
+        for (float[] b : HILLS) {
+            float dx = x - b[0], dz = z - b[1];
+            float d = (float) Math.sqrt(dx * dx + dz * dz);
+            if (d < b[2]) h += b[3] * (0.5f + 0.5f * MathUtils.cos(MathUtils.PI * d / b[2]));
+        }
+        return h;
+    }
+
+    /** True bila blok berpusat di (cx,cz) berisi bukit (tanpa gedung/trotoar). */
+    private static boolean isHillBlock(float cx, float cz) {
+        for (float[] b : HILLS) {
+            float dx = cx - b[0], dz = cz - b[1];
+            if (dx * dx + dz * dz < 18f * 18f) return true;
+        }
+        return false;
+    }
+
     // ================= KOTA (geometri statis digabung) =================
 
     private void buildCity() {
         ModelBuilder mb = new ModelBuilder();
 
-        // --- tanah + jalan + trotoar: 3 part dalam 1 model ---
+        // --- tanah: grid ber-displace (bukit) + alas datar di bawahnya ---
         mb.begin();
-        MeshPartBuilder p = mb.part("grass", GL20.GL_TRIANGLES,
+        MeshPartBuilder base = mb.part("base", GL20.GL_TRIANGLES,
+                Usage.Position | Usage.Normal, colorMat(0.2f, 0.35f, 0.18f));
+        base.box(0, -0.3f, 0, WORLD, 0.5f, WORLD);
+        MeshPartBuilder grid = mb.part("grassGrid", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal | Usage.TextureCoordinates,
                 texMat("tex-grass.jpg", new Color(0.35f, 0.6f, 0.3f, 1f)));
-        p.setUVRange(0, 0, 12, 12);
-        p.box(0, -0.25f, 0, WORLD, 0.5f, WORLD);
-        p = mb.part("asphalt", GL20.GL_TRIANGLES,
+        int seg = 50;
+        float cell = WORLD / seg; // 8 unit per quad
+        for (int ix = 0; ix < seg; ix++) {
+            for (int iz = 0; iz < seg; iz++) {
+                float x0 = -HALF + ix * cell, x1 = x0 + cell;
+                float z0 = -HALF + iz * cell, z1 = z0 + cell;
+                float h00 = heightAt(x0, z0), h10 = heightAt(x1, z0);
+                float h11 = heightAt(x1, z1), h01 = heightAt(x0, z1);
+                float dhdx = ((h10 + h11) - (h00 + h01)) / (2f * cell);
+                float dhdz = ((h01 + h11) - (h00 + h10)) / (2f * cell);
+                tmpN.set(-dhdx, 1f, -dhdz).nor();
+                grid.setUVRange(0, 0, 1, 1);
+                // Urutan sudut CCW dilihat dari atas (normal +Y), sama seperti
+                // sisi atas box() libGDX — kalau terbalik, quad tercull.
+                grid.rect(x0, h01, z1, x1, h11, z1, x1, h10, z0, x0, h00, z0,
+                        tmpN.x, tmpN.y, tmpN.z);
+            }
+        }
+        MeshPartBuilder p = mb.part("asphalt", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal | Usage.TextureCoordinates,
                 texMat("tex-asphalt.jpg", new Color(0.2f, 0.2f, 0.22f, 1f)));
         for (float c : ROADS) {
-            p.setUVRange(0, 0, 24, 1);
+            p.setUVRange(0, 0, 40, 1);
             p.box(0, 0.02f, c, WORLD, 0.08f, ROAD_W);
-            p.setUVRange(0, 0, 1, 24);
+            p.setUVRange(0, 0, 1, 40);
             p.box(c, 0.04f, 0, ROAD_W, 0.08f, WORLD);
         }
         p = mb.part("sidewalk", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal | Usage.TextureCoordinates,
                 texMat("tex-sidewalk.jpg", new Color(0.7f, 0.7f, 0.68f, 1f)));
-        for (int bx = 0; bx < 4; bx++) {
-            for (int bz = 0; bz < 4; bz++) {
-                float cx = -60f + bx * 40f, cz = -60f + bz * 40f;
+        for (int bx = 0; bx < 10; bx++) {
+            for (int bz = 0; bz < 10; bz++) {
+                float cx = -180f + bx * 40f, cz = -180f + bz * 40f;
+                if (isHillBlock(cx, cz)) continue; // bukit dibiarkan terlihat
                 p.setUVRange(0, 0, 3, 3);
                 p.box(cx, 0f, cz, 30f, 0.06f, 30f);
             }
@@ -314,7 +408,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         models.add(haze);
         hazeInst = new ModelInstance(haze);
 
-        // --- gedung: 2 part (fasad + atap) dalam 1 model ---
+        // --- gedung: 4 part (fasad + atap + pintu + papan nama) dalam 1 model ---
         mb.begin();
         p = mb.part("facade", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal | Usage.TextureCoordinates,
@@ -322,25 +416,35 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         MeshPartBuilder roof = mb.part("roof", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal,
                 colorMat(0.16f, 0.17f, 0.2f));
-        for (int bx = 0; bx < 4; bx++) {
-            for (int bz = 0; bz < 4; bz++) {
-                float cx = -60f + bx * 40f, cz = -60f + bz * 40f;
-                // blok taman di tengah-timur (Verdant Bluffs ala GTA SA)
-                if (bx == 2 && bz == 2) continue;
+        MeshPartBuilder doorP = mb.part("door", GL20.GL_TRIANGLES,
+                Usage.Position | Usage.Normal, colorMat(0.45f, 0.28f, 0.12f));
+        MeshPartBuilder signP = mb.part("sign", GL20.GL_TRIANGLES,
+                Usage.Position | Usage.Normal, colorMat(0.95f, 0.92f, 0.8f));
+        for (int bx = 0; bx < 10; bx++) {
+            for (int bz = 0; bz < 10; bz++) {
+                float cx = -180f + bx * 40f, cz = -180f + bz * 40f;
+                if (isHillBlock(cx, cz)) continue; // blok bukit: tanpa gedung
                 float distC = (float) Math.sqrt(cx * cx + cz * cz);
-                float hBase = 8f + (1f - Math.min(distC / 130f, 1f)) * 20f;
+                float hBase = 8f + (1f - Math.min(distC / 260f, 1f)) * 20f;
+                int entIdx = -1;
+                for (int e = 0; e < ENTER_SPOTS.length; e++) {
+                    if (ENTER_SPOTS[e][0] == cx && ENTER_SPOTS[e][1] == cz) entIdx = e;
+                }
                 if ((bx + bz) % 2 == 0) {
                     // 1 gedung besar + 1 annex kecil di sudut blok
                     float w = 13f + rng.nextFloat() * 2f, d = 13f + rng.nextFloat() * 2f;
                     float h = hBase + rng.nextFloat() * 6f;
                     addBuilding(p, roof, cx, cz, w, h, d);
+                    if (entIdx >= 0) addDoor(doorP, signP, entIdx, cx, cz, w, d);
                     addBuilding(p, roof, cx - 11f, cz - 11f, 6f, 5f + rng.nextFloat() * 2f, 6f);
                 } else {
-                    // 2 gedung kecil berdampingan
+                    // 2 gedung kecil berdampingan (gedung pertama bisa dimasukin)
                     for (int k = 0; k < 2; k++) {
+                        float bx2 = cx + (k == 0 ? -7.5f : 7.5f);
                         float w = 8f + rng.nextFloat() * 3f, d = 12f + rng.nextFloat() * 4f;
                         float h = hBase * 0.7f + rng.nextFloat() * 5f;
-                        addBuilding(p, roof, cx + (k == 0 ? -7.5f : 7.5f), cz, w, h, d);
+                        addBuilding(p, roof, bx2, cz, w, h, d);
+                        if (entIdx >= 0 && k == 0) addDoor(doorP, signP, entIdx, bx2, cz, w, d);
                     }
                 }
             }
@@ -355,16 +459,20 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 colorMat(0.35f, 0.22f, 0.12f));
         MeshPartBuilder canopy = mb.part("canopy", GL20.GL_TRIANGLES,
                 Usage.Position | Usage.Normal, colorMat(0.2f, 0.5f, 0.2f));
-        // taman: 6 pohon
+        // taman (20,20): 6 pohon di atas bukit taman
         for (int i = 0; i < 6; i++) {
             float x = 8f + rng.nextFloat() * 24f, z = 8f + rng.nextFloat() * 24f;
-            addTree(p, canopy, x, z);
+            addTree(p, canopy, x, z, heightAt(x, z));
         }
+        // bukit pinggir: 4 pohon
+        float[][] hillTrees = {{-188f, -172f}, {-172f, -188f}, {-186f, -186f}, {-174f, -174f},
+                {132f, -148f}, {148f, -132f}, {140f, -148f}};
+        for (float[] t : hillTrees) addTree(p, canopy, t[0], t[1], heightAt(t[0], t[1]));
         // pinggir trotoar: 8 pohon
         for (int i = 0; i < 8; i++) {
-            float x = -100f + rng.nextFloat() * 200f;
+            float x = -190f + rng.nextFloat() * 380f;
             float z = ROADS[rng.nextInt(ROADS.length)] + (rng.nextBoolean() ? 8f : -8f);
-            addTree(p, canopy, x, z);
+            addTree(p, canopy, x, z, 0f);
         }
         Model trees = mb.end();
         models.add(trees);
@@ -382,9 +490,24 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         buildingBoxes.add(new Rectangle(cx - w / 2f, cz - d / 2f, w, d));
     }
 
-    private void addTree(MeshPartBuilder trunk, MeshPartBuilder canopy, float x, float z) {
-        trunk.box(x, 1.1f, z, 0.5f, 2.2f, 0.5f);
-        canopy.sphere(tmpM.setToTranslation(x, 3.6f, z), 3.2f, 3.2f, 3.2f, 10, 8);
+    private void addTree(MeshPartBuilder trunk, MeshPartBuilder canopy,
+                         float x, float z, float baseY) {
+        trunk.box(x, baseY + 1.1f, z, 0.5f, 2.2f, 0.5f);
+        canopy.sphere(tmpM.setToTranslation(x, baseY + 3.6f, z), 3.2f, 3.2f, 3.2f, 10, 8);
+    }
+
+    /** Pintu + papan nama di fasad +Z gedung yang bisa dimasukin. */
+    private void addDoor(MeshPartBuilder doorP, MeshPartBuilder signP,
+                         int entIdx, float cx, float cz, float w, float d) {
+        doorP.box(cx, 1.2f, cz + d / 2f + 0.1f, 1.8f, 2.4f, 0.25f);
+        signP.box(cx, 2.9f, cz + d / 2f + 0.12f, 3.2f, 0.9f, 0.15f);
+        Enterable en = new Enterable();
+        en.name = ENTER_NAMES[entIdx];
+        en.type = (int) ENTER_SPOTS[entIdx][2];
+        en.bx = cx;
+        en.bz = cz;
+        en.door.set(cx, 0f, cz + d / 2f + 1.0f);
+        enterables.add(en);
     }
 
     private void buildLamps() {
@@ -510,6 +633,84 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         }
     }
 
+    // ================= TRAFFIC (mobil NPC, ambient) =================
+
+    private void buildTraffic() {
+        // Warna beda dari 4 mobil parkir (merah/kuning/biru/putih).
+        float[][] defs = {
+                {0.55f, 0.25f, 0.75f}, {0.95f, 0.5f, 0.1f}, {0.1f, 0.7f, 0.7f},
+                {0.9f, 0.3f, 0.6f}, {0.5f, 0.85f, 0.2f}, {0.45f, 0.45f, 0.5f},
+                {0.6f, 0.2f, 0.2f}, {0.15f, 0.8f, 0.9f},
+        };
+        ModelBuilder mb = new ModelBuilder();
+        for (float[] d : defs) {
+            // 1 model, 3 part: bodi + kabin + 4 roda kotak (statis, tanpa putar).
+            mb.begin();
+            MeshPartBuilder p = mb.part("tbody", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, shinyMat(d[0], d[1], d[2], 0.9f, 64f));
+            p.box(0, 0.55f, 0, 1.8f, 0.7f, 3.6f);
+            p = mb.part("tcabin", GL20.GL_TRIANGLES, Usage.Position | Usage.Normal,
+                    shinyMat(0.1f, 0.12f, 0.16f, 0.9f, 64f));
+            p.box(0, 1.2f, -0.2f, 1.6f, 0.6f, 1.8f);
+            p = mb.part("twheels", GL20.GL_TRIANGLES, Usage.Position | Usage.Normal,
+                    colorMat(0.08f, 0.08f, 0.09f));
+            p.box(0.85f, 0.42f, 1.15f, 0.3f, 0.84f, 0.84f);
+            p.box(-0.85f, 0.42f, 1.15f, 0.3f, 0.84f, 0.84f);
+            p.box(0.85f, 0.42f, -1.15f, 0.3f, 0.84f, 0.84f);
+            p.box(-0.85f, 0.42f, -1.15f, 0.3f, 0.84f, 0.84f);
+            Model m = mb.end();
+            models.add(m);
+            TrafficCar t = new TrafficCar();
+            t.inst = new ModelInstance(m);
+            t.targetSpeed = 8f + rng.nextFloat() * 5f;
+            // Start: persimpangan acak, sudah di lajur kanan.
+            t.ix = ROADS[rng.nextInt(ROADS.length)];
+            t.iz = ROADS[rng.nextInt(ROADS.length)];
+            int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+            int[] dir = dirs[rng.nextInt(4)];
+            t.dirX = dir[0];
+            t.dirZ = dir[1];
+            t.heading = (float) Math.atan2(t.dirX, t.dirZ);
+            // lajur kanan: right = (-dirZ, dirX) * 2.5
+            t.pos.set(t.ix - t.dirZ * 2.5f, 0, t.iz + t.dirX * 2.5f);
+            pickNextTarget(t);
+            traffic.add(t);
+        }
+    }
+
+    /** Pilih persimpangan berikut (tetap di grid jalan) + target di lajur kanan. */
+    private void pickNextTarget(TrafficCar t) {
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        int[] w = {1, 1, 1, 1};
+        for (int i = 0; i < 4; i++) {
+            if (dirs[i][0] == (int) t.dirX && dirs[i][1] == (int) t.dirZ) w[i] = 3; // lurus 3x
+        }
+        int pick = -1;
+        for (int tries = 0; tries < 12 && pick < 0; tries++) {
+            int total = w[0] + w[1] + w[2] + w[3];
+            int r = rng.nextInt(total), acc = 0;
+            for (int i = 0; i < 4; i++) {
+                acc += w[i];
+                if (r < acc) {
+                    float nx = t.ix + dirs[i][0] * 40f, nz = t.iz + dirs[i][1] * 40f;
+                    if (nx >= -160f && nx <= 160f && nz >= -160f && nz <= 160f) pick = i;
+                    break;
+                }
+            }
+        }
+        if (pick < 0) { // mentok di sudut: putar balik
+            for (int i = 0; i < 4; i++) {
+                if (dirs[i][0] == -(int) t.dirX && dirs[i][1] == -(int) t.dirZ) pick = i;
+            }
+        }
+        t.dirX = dirs[pick][0];
+        t.dirZ = dirs[pick][1];
+        t.ix += t.dirX * 40f;
+        t.iz += t.dirZ * 40f;
+        t.tx = t.ix - t.dirZ * 2.5f;
+        t.tz = t.iz + t.dirX * 2.5f;
+    }
+
     // ================= PEJALAN KAKI =================
 
     private void buildNpcs() {
@@ -517,6 +718,8 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         float[][] shirts = {
                 {0.2f, 0.7f, 0.3f}, {0.9f, 0.5f, 0.15f}, {0.6f, 0.3f, 0.8f},
                 {0.9f, 0.4f, 0.55f}, {0.5f, 0.5f, 0.5f}, {0.15f, 0.6f, 0.65f},
+                {0.3f, 0.3f, 0.9f}, {0.9f, 0.9f, 0.3f}, {0.4f, 0.8f, 0.9f},
+                {0.8f, 0.4f, 0.2f}, {0.5f, 0.9f, 0.5f}, {0.7f, 0.7f, 0.9f},
         };
         ModelBuilder mb = new ModelBuilder();
         mb.begin();
@@ -525,19 +728,20 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         p.box(0, 1.72f, 0, 0.42f, 0.42f, 0.42f);
         Model headM = mb.end();
         models.add(headM);
-        for (int i = 0; i < 6; i++) {
+        for (int i = 0; i < 12; i++) {
             Npc n = new Npc();
             float road = ROADS[rng.nextInt(ROADS.length)];
             n.alongX = rng.nextBoolean();
             n.dir = rng.nextBoolean() ? 1f : -1f;
             n.speed = 1.2f + rng.nextFloat() * 0.8f;
             if (n.alongX) {
-                n.pos.set(-100f + rng.nextFloat() * 200f, 0, road + (rng.nextBoolean() ? 7.5f : -7.5f));
+                n.pos.set(-190f + rng.nextFloat() * 380f, 0, road + (rng.nextBoolean() ? 7.5f : -7.5f));
                 n.heading = n.dir > 0 ? MathUtils.PI / 2f : -MathUtils.PI / 2f;
             } else {
-                n.pos.set(road + (rng.nextBoolean() ? 7.5f : -7.5f), 0, -100f + rng.nextFloat() * 200f);
+                n.pos.set(road + (rng.nextBoolean() ? 7.5f : -7.5f), 0, -190f + rng.nextFloat() * 380f);
                 n.heading = n.dir > 0 ? 0f : MathUtils.PI;
             }
+            n.pos.y = heightAt(n.pos.x, n.pos.z);
             mb.begin();
             p = mb.part("body", GL20.GL_TRIANGLES, Usage.Position | Usage.Normal,
                     colorMat(shirts[i][0], shirts[i][1], shirts[i][2]));
@@ -554,9 +758,11 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     // ================= KOIN =================
 
     private void buildCoins() {
+        // 15 koin, semua di jalan (gampang dijangkau mobil) kecuali 1 di taman.
         float[][] spots = {
                 {0f, 0f}, {40f, 20f}, {-40f, -60f}, {80f, 40f}, {-80f, 0f},
-                {20f, 80f}, {-20f, -80f}, {60f, -40f}, {-60f, 60f}, {20f, 20f},
+                {20f, 80f}, {-20f, -80f}, {60f, -40f}, {-60f, 40f}, {20f, 20f},
+                {120f, -100f}, {-140f, 80f}, {160f, 140f}, {-160f, -120f}, {100f, 160f},
         };
         ModelBuilder mb = new ModelBuilder();
         mb.begin();
@@ -567,10 +773,75 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         models.add(coinM);
         for (int i = 0; i < spots.length; i++) {
             Coin c = new Coin();
-            c.pos.set(spots[i][0], 0, spots[i][1]);
+            c.pos.set(spots[i][0], heightAt(spots[i][0], spots[i][1]), spots[i][1]);
             c.phase = rng.nextFloat() * 6f;
             c.inst = new ModelInstance(coinM);
             coins.add(c);
+        }
+    }
+
+    // ================= INTERIOR GEDUNG (di bawah map, y=-60) =================
+
+    private void buildInteriors() {
+        // Tiap ruangan: lantai + langit-langit + 4 dinding + furnitur khas.
+        // Ruangan tipe i berpusat di (i*30, -60, 0); hanya ruangan yang sedang
+        // dimasukin yang di-render (di bawah tanah, tak terlihat dari kota).
+        for (int type = 0; type < 3; type++) {
+            float rx = type * 30f;
+            Room rm = new Room();
+            rm.name = ENTER_NAMES[type];
+            rm.center.set(rx, -60f, 0f);
+            rm.exitDoor.set(rx, -60f, -3.0f);
+            ModelBuilder mb = new ModelBuilder();
+            mb.begin();
+            float[] wc = type == 0 ? new float[]{0.6f, 0.8f, 0.6f}
+                    : type == 1 ? new float[]{0.9f, 0.85f, 0.7f}
+                    : new float[]{0.6f, 0.6f, 0.62f};
+            MeshPartBuilder wall = mb.part("wall", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, colorMat(wc[0], wc[1], wc[2]));
+            wall.box(rx, -58f, -4f, 12f, 4f, 0.4f);   // utara
+            wall.box(rx, -58f, 4f, 12f, 4f, 0.4f);    // selatan
+            wall.box(rx - 6f, -58f, 0, 0.4f, 4f, 8f); // barat
+            wall.box(rx + 6f, -58f, 0, 0.4f, 4f, 8f); // timur
+            float[] fc = type == 2 ? new float[]{0.5f, 0.5f, 0.5f}
+                    : new float[]{0.55f, 0.4f, 0.25f};
+            MeshPartBuilder floor = mb.part("floor", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, colorMat(fc[0], fc[1], fc[2]));
+            floor.box(rx, -60.25f, 0, 12f, 0.5f, 8f); // lantai (atas di -60)
+            floor.box(rx, -55.75f, 0, 12f, 0.5f, 8f); // langit-langit (bawah di -56)
+            MeshPartBuilder door = mb.part("door", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, colorMat(0.45f, 0.28f, 0.12f));
+            door.box(rx, -59f, -3.75f, 1.6f, 2.2f, 0.15f); // pintu keluar (visual)
+            MeshPartBuilder furn = mb.part("furn", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, colorMat(0.5f, 0.35f, 0.2f));
+            MeshPartBuilder furn2 = mb.part("furn2", GL20.GL_TRIANGLES,
+                    Usage.Position | Usage.Normal, colorMat(0.15f, 0.15f, 0.18f));
+            if (type == 0) { // TOKO: 3 rak + meja kasir
+                for (int k = -1; k <= 1; k++) {
+                    furn.box(rx + k * 4f, -59f, -3.0f, 2.5f, 2f, 0.8f);
+                    rm.furn.add(new Rectangle(rx + k * 4f - 1.25f, -3.4f, 2.5f, 0.8f));
+                }
+                furn.box(rx + 3.5f, -59.5f, 1.5f, 2.5f, 1f, 1f);
+                rm.furn.add(new Rectangle(rx + 3.5f - 1.25f, 1f, 2.5f, 1f));
+            } else if (type == 1) { // RUMAH: tempat tidur + meja + kursi
+                furn.box(rx - 3.5f, -59.7f, -2f, 2.2f, 0.6f, 3.5f);
+                rm.furn.add(new Rectangle(rx - 3.5f - 1.1f, -3.75f, 2.2f, 3.5f));
+                furn.box(rx - 3.5f, -59.5f, -3.4f, 2.2f, 0.4f, 0.4f); // bantal
+                furn2.box(rx + 2f, -59.6f, 0.5f, 2f, 0.8f, 1.2f);
+                rm.furn.add(new Rectangle(rx + 2f - 1f, -0.1f, 2f, 1.2f));
+                furn2.box(rx + 2f, -59.8f, 2.2f, 0.8f, 0.5f, 0.8f);
+            } else { // BENGKEL: meja kerja + tumpukan ban + perkakas
+                furn.box(rx - 3f, -59.5f, -2.5f, 3f, 1f, 1.2f);
+                rm.furn.add(new Rectangle(rx - 3f - 1.5f, -3.1f, 3f, 1.2f));
+                furn2.box(rx + 3f, -59.8f, 1f, 1f, 0.35f, 1f);
+                furn2.box(rx + 3f, -59.45f, 1f, 1f, 0.35f, 1f);
+                furn.box(rx - 3.5f, -58.9f, -2.5f, 0.5f, 0.2f, 0.5f);
+                furn.box(rx - 2.5f, -58.9f, -2.3f, 0.4f, 0.2f, 0.4f);
+            }
+            Model m = mb.end();
+            models.add(m);
+            rm.inst = new ModelInstance(m);
+            rooms.add(rm);
         }
     }
 
@@ -586,6 +857,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         rRem.set(w - 460, h - 170, 190, 130);
         rJump.set(w - 240, h - 330, 200, 110);
         rEnter.set(w - 460, h - 330, 190, 110);
+        rMapClose.set(w / 2f - 100, h - 70, 200, 60);
         joyBaseX = 120;
         joyBaseY = h - 140;
     }
@@ -614,6 +886,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     }
 
     private void update(float dt) {
+        if (mapOpen) return; // peta fullscreen: dunia di-PAUSE
         time += dt;
         dragPause = Math.max(0f, dragPause - dt);
         float joyLen = (float) Math.sqrt(joyX * joyX + joyY * joyY);
@@ -627,12 +900,14 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         else updatePlayer(dt, joyLen);
 
         updateNpcs(dt);
+        updateTraffic(dt);
         updateCoins(dt);
         updateCamera(dt);
         updateHum();
     }
 
     private void updatePlayer(float dt, float joyLen) {
+        float groundH = inInterior ? -60f : heightAt(pPos.x, pPos.z);
         if (joyLen > 0.08f) {
             // Gerak relatif terhadap arah kamera YANG TERLIHAT (yaw terhalus),
             // bukan yaw target — supaya arah joystick selalu cocok dengan layar.
@@ -651,9 +926,13 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 pHeading = lerpAngle(pHeading, targetH, 1f - (float) Math.exp(-12f * dt));
                 walkPhase += dt * speed * 1.5f;
             }
-            collideCircle(pPos, 0.5f, false);
+            if (inInterior) {
+                collideCircle(pPos, 0.5f, false, rooms.get(curRoom).furn);
+            } else {
+                collideCircle(pPos, 0.5f, false, buildingBoxes);
+            }
         }
-        // lompat + gravitasi
+        // lompat + gravitasi (lantai = tinggi tanah setempat / lantai interior)
         if (jumpQueued) {
             jumpQueued = false;
             if (pOnGround) {
@@ -665,14 +944,22 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         if (!pOnGround) {
             pVelY -= 22f * dt;
             pPos.y += pVelY * dt;
-            if (pPos.y <= 0f) {
-                pPos.y = 0f;
+            if (pPos.y <= groundH) {
+                pPos.y = groundH;
                 pVelY = 0f;
                 pOnGround = true;
             }
+        } else {
+            pPos.y = groundH; // jalan kaki mengikuti tinggi tanah (naik bukit)
         }
-        pPos.x = MathUtils.clamp(pPos.x, -HALF + 2f, HALF - 2f);
-        pPos.z = MathUtils.clamp(pPos.z, -HALF + 2f, HALF - 2f);
+        if (inInterior) {
+            Room rm = rooms.get(curRoom);
+            pPos.x = MathUtils.clamp(pPos.x, rm.center.x - 5.2f, rm.center.x + 5.2f);
+            pPos.z = MathUtils.clamp(pPos.z, -3.2f, 3.2f);
+        } else {
+            pPos.x = MathUtils.clamp(pPos.x, -HALF + 2f, HALF - 2f);
+            pPos.z = MathUtils.clamp(pPos.z, -HALF + 2f, HALF - 2f);
+        }
     }
 
     private void updateCar(float dt, float joyLen) {
@@ -707,16 +994,17 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         c.pos.x += fx * c.speed * dt;
         c.pos.z += fz * c.speed * dt;
         c.spin += c.speed / 0.42f * dt;
-        if (collideCircle(c.pos, 1.7f, true)) c.speed *= 0.35f;
+        if (collideCircle(c.pos, 1.7f, true, buildingBoxes)) c.speed *= 0.35f;
         c.pos.x = MathUtils.clamp(c.pos.x, -HALF + 2f, HALF - 2f);
         c.pos.z = MathUtils.clamp(c.pos.z, -HALF + 2f, HALF - 2f);
+        c.pos.y = heightAt(c.pos.x, c.pos.z); // mobil mengikuti tanah (0 di jalan)
         hudSpeed = "KECEPATAN: " + (int) (Math.abs(c.speed) * 3.6f) + " km/jam";
     }
 
-    /** Tabrakan lingkaran vs AABB gedung; dorong keluar, kembalikan true bila menabrak. */
-    private boolean collideCircle(Vector3 pos, float r, boolean car) {
+    /** Tabrakan lingkaran vs AABB; dorong keluar, kembalikan true bila menabrak. */
+    private boolean collideCircle(Vector3 pos, float r, boolean car, Array<Rectangle> boxes) {
         boolean hit = false;
-        for (Rectangle b : buildingBoxes) {
+        for (Rectangle b : boxes) {
             float cx = MathUtils.clamp(pos.x, b.x, b.x + b.width);
             float cz = MathUtils.clamp(pos.z, b.y, b.y + b.height);
             float dx = pos.x - cx, dz = pos.z - cz;
@@ -745,6 +1033,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     private void updateNpcs(float dt) {
         for (Npc n : npcs) {
             n.bobT += dt;
+            n.pos.y = heightAt(n.pos.x, n.pos.z); // jalan mengikuti tanah
             if (n.alongX) {
                 n.pos.x += n.dir * n.speed * dt;
                 // di persimpangan: kadang belok
@@ -780,7 +1069,50 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         }
     }
 
+    private void updateTraffic(float dt) {
+        for (TrafficCar t : traffic) {
+            float dx = t.tx - t.pos.x, dz = t.tz - t.pos.z;
+            if (dx * dx + dz * dz < 5f * 5f) pickNextTarget(t);
+            float want = carAhead(t) ? 0f : t.targetSpeed;
+            t.speed += (want - t.speed) * Math.min(1f, 2.5f * dt);
+            if (t.speed < 0.05f && want == 0f) t.speed = 0f;
+            // belok halus ke arah target (waypoint persimpangan)
+            float desired = (float) Math.atan2(t.tx - t.pos.x, t.tz - t.pos.z);
+            t.heading = lerpAngle(t.heading, desired, 1f - (float) Math.exp(-3.0f * dt));
+            t.pos.x += MathUtils.sin(t.heading) * t.speed * dt;
+            t.pos.z += MathUtils.cos(t.heading) * t.speed * dt;
+            t.pos.y = heightAt(t.pos.x, t.pos.z); // 0 di jalan
+        }
+    }
+
+    /** True bila ada kendaraan/orang tepat di depan mobil traffic (jarak < 8). */
+    private boolean carAhead(TrafficCar t) {
+        float fx = MathUtils.sin(t.heading), fz = MathUtils.cos(t.heading);
+        for (TrafficCar o : traffic) {
+            if (o != t && ahead(t, o.pos, fx, fz)) return true;
+        }
+        for (Car c : cars) {
+            if (ahead(t, c.pos, fx, fz)) return true;
+        }
+        if (driving && currentCar != null) {
+            if (ahead(t, currentCar.pos, fx, fz)) return true;
+        } else if (ahead(t, pPos, fx, fz)) {
+            return true;
+        }
+        return false;
+    }
+
+    private boolean ahead(TrafficCar t, Vector3 p, float fx, float fz) {
+        float dx = p.x - t.pos.x, dz = p.z - t.pos.z;
+        float d2 = dx * dx + dz * dz;
+        if (d2 > 64f) return false; // > 8 unit
+        float d = (float) Math.sqrt(d2);
+        if (d < 0.01f) return true;
+        return (dx * fx + dz * fz) / d > 0.7f;
+    }
+
     private void updateCoins(float dt) {
+        if (inInterior) return; // koin kota tidak bisa diambil dari bawah tanah
         Vector3 ref = driving && currentCar != null ? currentCar.pos : pPos;
         float collectR = driving ? 2.6f : 1.8f;
         for (Coin c : coins) {
@@ -826,7 +1158,15 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 camTargetS.x + MathUtils.sin(camYawS) * cp * camDistS,
                 camTargetS.y + sp * camDistS,
                 camTargetS.z + MathUtils.cos(camYawS) * cp * camDistS);
-        if (cam.position.y < 0.6f) cam.position.y = 0.6f; // jangan tembus tanah
+        // Tinggi minimum kamera terhadap tanah setempat (bukit) / lantai interior.
+        if (!inInterior) {
+            float gy = heightAt(cam.position.x, cam.position.z) + 0.6f;
+            if (cam.position.y < gy) cam.position.y = gy;
+        } else {
+            // Di dalam ruangan: kamera di antara lantai (-60) dan langit-langit (-56).
+            if (cam.position.y < -59.4f) cam.position.y = -59.4f;
+            if (cam.position.y > -56.3f) cam.position.y = -56.3f;
+        }
         // JAMINAN ANTI-ROLL (v1.0.2): up vector DI-RESET ke (0,1,0) SETIAP frame
         // sebelum lookAt. Posisi kamera dihitung murni dari koordinat bola
         // (yaw/pitch/jarak) dan orientasi HANYA dari lookAt — objek kamera
@@ -894,6 +1234,15 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     private void renderScene() {
         Gdx.gl.glClearColor(0.55f, 0.75f, 0.93f, 1f);
         Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT | GL20.GL_DEPTH_BUFFER_BIT);
+        if (inInterior) {
+            // Di dalam gedung: hanya ruangan + pemain (kota di atas tak terlihat).
+            modelBatch.begin(cam);
+            modelBatch.render(rooms.get(curRoom).inst, env);
+            renderPlayer();
+            modelBatch.end();
+            renderHud();
+            return;
+        }
         modelBatch.begin(cam);
         modelBatch.render(groundInst, env);
         modelBatch.render(hazeInst, env);
@@ -902,10 +1251,18 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         modelBatch.render(lampsInst, env);
         if (!driving) renderPlayer();
         for (Car c : cars) if (visible(c.pos, 3f)) renderCar(c);
+        for (TrafficCar t : traffic) if (visible(t.pos, 3f)) renderTraffic(t);
         for (Npc n : npcs) if (visible(n.pos, 1.5f)) renderNpc(n);
         for (Coin c : coins) if (!c.taken && visible(c.pos, 1f)) renderCoin(c);
         modelBatch.end();
         renderHud();
+        if (mapOpen) renderFullMap();
+    }
+
+    private void renderTraffic(TrafficCar t) {
+        float hd = t.heading * MathUtils.radiansToDegrees;
+        t.inst.transform.setToTranslation(t.pos).rotate(Vector3.Y, hd);
+        modelBatch.render(t.inst, env);
     }
 
     private void renderPlayer() {
@@ -922,7 +1279,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         pLegL.transform.setToTranslation(tmp).rotate(Vector3.Y, hd).rotate(Vector3.X, -swD);
         tmp.set(-0.2f, 0.9f, 0).rotate(Vector3.Y, hd).add(pPos);
         pLegR.transform.setToTranslation(tmp).rotate(Vector3.Y, hd).rotate(Vector3.X, swD);
-        pBlob.transform.setToTranslation(pPos.x, 0.03f, pPos.z);
+        pBlob.transform.setToTranslation(pPos.x, pPos.y + 0.03f, pPos.z);
         modelBatch.render(pTorso, env);
         modelBatch.render(pHead, env);
         modelBatch.render(pArmL, env);
@@ -946,7 +1303,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                     .rotate(Vector3.Z, 90f);
             modelBatch.render(c.wheels[i], env);
         }
-        c.blob.transform.setToTranslation(c.pos.x, 0.03f, c.pos.z);
+        c.blob.transform.setToTranslation(c.pos.x, c.pos.y + 0.03f, c.pos.z);
         modelBatch.render(c.body, env);
         modelBatch.render(c.cabin, env);
         modelBatch.render(c.blob, env);
@@ -958,7 +1315,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         tmp.set(n.pos.x, n.pos.y + bob, n.pos.z);
         n.body.transform.setToTranslation(tmp).rotate(Vector3.Y, hd);
         n.head.transform.setToTranslation(tmp).rotate(Vector3.Y, hd);
-        n.blob.transform.setToTranslation(n.pos.x, 0.03f, n.pos.z);
+        n.blob.transform.setToTranslation(n.pos.x, n.pos.y + 0.03f, n.pos.z);
         modelBatch.render(n.body, env);
         modelBatch.render(n.head, env);
         modelBatch.render(n.blob, env);
@@ -967,7 +1324,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
     private void renderCoin(Coin c) {
         float bob = MathUtils.sin(time * 2f + c.phase) * 0.15f;
         float spin = (time * 2.5f + c.phase) * MathUtils.radiansToDegrees;
-        c.inst.transform.setToTranslation(c.pos.x, 0.9f + bob, c.pos.z)
+        c.inst.transform.setToTranslation(c.pos.x, c.pos.y + 0.9f + bob, c.pos.z)
                 .rotate(Vector3.Y, spin).rotate(Vector3.X, 90f);
         modelBatch.render(c.inst, env);
     }
@@ -996,31 +1353,45 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
             drawBtn(rEnter, "KELUAR");
         } else {
             drawBtn(rJump, "LOMPAT");
-            if (nearestCar() != null) drawBtn(rEnter, "MASUK MOBIL");
+            String lbl = enterLabel();
+            if (lbl != null) drawBtn(rEnter, lbl);
         }
-        // minimap (pojok kanan atas)
-        float mapSize = 190, mapX = w - 210, mapY = h - 210, s = mapSize / WORLD;
-        shapes.setColor(0, 0, 0, 0.55f);
-        shapes.rect(mapX - 5, mapY - 5, mapSize + 10, mapSize + 10);
-        shapes.setColor(0.25f, 0.55f, 0.25f, 1f);
-        shapes.rect(mapX + 125 * s, mapY + 85 * s, 30 * s, 30 * s); // taman
-        shapes.setColor(0.25f, 0.25f, 0.28f, 1f);
-        for (float c : ROADS) {
-            shapes.rect(mapX, mapY + (120 - c - ROAD_W / 2) * s, mapSize, ROAD_W * s);
-            shapes.rect(mapX + (c - ROAD_W / 2 + 120) * s, mapY, ROAD_W * s, mapSize);
+        // minimap (pojok kanan atas) — disembunyikan saat di dalam gedung
+        if (!inInterior) {
+            float mapSize = 190, mapX = w - 210, mapY = h - 210, s = mapSize / WORLD;
+            shapes.setColor(0, 0, 0, 0.55f);
+            shapes.rect(mapX - 5, mapY - 5, mapSize + 10, mapSize + 10);
+            shapes.setColor(0.25f, 0.55f, 0.25f, 1f);
+            mapRectOn(mapX, mapY, s, 20, 20, 30, 30); // taman
+            shapes.setColor(0.5f, 0.42f, 0.3f, 1f);
+            mapRectOn(mapX, mapY, s, -180, -180, 30, 30); // bukit
+            mapRectOn(mapX, mapY, s, 140, -140, 30, 30); // bukit
+            shapes.setColor(0.25f, 0.25f, 0.28f, 1f);
+            for (float c : ROADS) {
+                mapRectOn(mapX, mapY, s, 0, c, WORLD, ROAD_W);
+                mapRectOn(mapX, mapY, s, c, 0, ROAD_W, WORLD);
+            }
+            shapes.setColor(1f, 0.8f, 0.2f, 1f);
+            for (Coin c : coins) {
+                if (c.taken) continue;
+                mapDot(mapX, mapY, s, c.pos.x, c.pos.z, 3.5f);
+            }
+            shapes.setColor(0.3f, 0.6f, 1f, 1f);
+            for (Car c : cars) {
+                mapDot(mapX, mapY, s, c.pos.x, c.pos.z, 4.5f);
+            }
+            shapes.setColor(1f, 0.55f, 0.1f, 1f);
+            for (TrafficCar t : traffic) {
+                mapDot(mapX, mapY, s, t.pos.x, t.pos.z, 4f);
+            }
+            shapes.setColor(0.3f, 0.9f, 0.4f, 1f);
+            for (Enterable e : enterables) {
+                mapDot(mapX, mapY, s, e.bx, e.bz, 5f);
+            }
+            Vector3 ref = driving && currentCar != null ? currentCar.pos : pPos;
+            shapes.setColor(1f, 1f, 1f, 1f);
+            mapDot(mapX, mapY, s, ref.x, ref.z, 5.5f);
         }
-        shapes.setColor(1f, 0.8f, 0.2f, 1f);
-        for (Coin c : coins) {
-            if (c.taken) continue;
-            shapes.circle(mapX + (c.pos.x + 120) * s, mapY + (120 - c.pos.z) * s, 3.5f, 8);
-        }
-        shapes.setColor(0.3f, 0.6f, 1f, 1f);
-        for (Car c : cars) {
-            shapes.circle(mapX + (c.pos.x + 120) * s, mapY + (120 - c.pos.z) * s, 4.5f, 8);
-        }
-        Vector3 ref = driving && currentCar != null ? currentCar.pos : pPos;
-        shapes.setColor(1f, 1f, 1f, 1f);
-        shapes.circle(mapX + (ref.x + 120) * s, mapY + (120 - ref.z) * s, 5.5f, 10);
         shapes.end();
 
         // teks
@@ -1031,6 +1402,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
         font.draw(batch, hudCoins, w / 2f - 100, h - 30);
         font.draw(batch, hudFps, 16, h - 100);
         if (driving) font.draw(batch, hudSpeed, w / 2f - 160, 70);
+        if (inInterior) font.draw(batch, "DI DALAM: " + rooms.get(curRoom).name, w / 2f - 110, h - 65);
         if (won) {
             font.getData().setScale(3f);
             font.setColor(Color.GOLD);
@@ -1048,11 +1420,146 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
             drawBtnLabel(rEnter, "KELUAR");
         } else {
             drawBtnLabel(rJump, "LOMPAT");
-            if (nearestCar() != null) drawBtnLabel(rEnter, "MASUK MOBIL");
+            String lbl = enterLabel();
+            if (lbl != null) drawBtnLabel(rEnter, lbl);
         }
         batch.end();
         Gdx.gl.glEnable(GL20.GL_DEPTH_TEST);
         Gdx.gl.glDisable(GL20.GL_BLEND);
+    }
+
+    // ================= PETA FULLSCREEN + GEDUNG MASUK =================
+
+    /** Kotak (wx,wz,ww,wd) dunia -> rect di peta (px,py = sudut kiri-bawah, y-up). */
+    private void mapRectOn(float px, float py, float s, float wx, float wz, float ww, float wd) {
+        shapes.rect(px + (wx - ww / 2f + HALF) * s, py + (HALF - wz - wd / 2f) * s, ww * s, wd * s);
+    }
+
+    /** Titik (wx,wz) dunia -> lingkaran di peta. */
+    private void mapDot(float px, float py, float s, float wx, float wz, float r) {
+        shapes.circle(px + (wx + HALF) * s, py + (HALF - wz) * s, r, 10);
+    }
+
+    /** Overlay peta fullscreen (dipanggil setelah renderHud, di atas segalanya). */
+    private void renderFullMap() {
+        int w = Gdx.graphics.getWidth(), h = Gdx.graphics.getHeight();
+        float ps = Math.min(w, h) * 0.8f;
+        float px = (w - ps) / 2f, py = (h - ps) / 2f; // y-up
+        float s = ps / WORLD;
+        Gdx.gl.glDisable(GL20.GL_DEPTH_TEST);
+        Gdx.gl.glEnable(GL20.GL_BLEND);
+        shapes.setProjectionMatrix(ortho);
+        shapes.begin(ShapeRenderer.ShapeType.Filled);
+        shapes.setColor(0, 0, 0, 0.6f);
+        shapes.rect(0, 0, w, h); // gelapkan dunia di belakang
+        shapes.setColor(0.08f, 0.1f, 0.12f, 0.95f);
+        shapes.rect(px - 8, py - 8, ps + 16, ps + 16);
+        shapes.setColor(0.25f, 0.55f, 0.25f, 1f);
+        mapRectOn(px, py, s, 20, 20, 30, 30); // taman
+        shapes.setColor(0.5f, 0.42f, 0.3f, 1f);
+        mapRectOn(px, py, s, -180, -180, 30, 30); // bukit
+        mapRectOn(px, py, s, 140, -140, 30, 30); // bukit
+        shapes.setColor(0.3f, 0.3f, 0.34f, 1f);
+        for (float c : ROADS) {
+            mapRectOn(px, py, s, 0, c, WORLD, ROAD_W);
+            mapRectOn(px, py, s, c, 0, ROAD_W, WORLD);
+        }
+        shapes.setColor(1f, 0.8f, 0.2f, 1f);
+        for (Coin c : coins) {
+            if (c.taken) continue;
+            mapDot(px, py, s, c.pos.x, c.pos.z, 5f);
+        }
+        shapes.setColor(0.3f, 0.6f, 1f, 1f);
+        for (Car c : cars) mapDot(px, py, s, c.pos.x, c.pos.z, 6f);
+        shapes.setColor(1f, 0.55f, 0.1f, 1f);
+        for (TrafficCar t : traffic) mapDot(px, py, s, t.pos.x, t.pos.z, 6f);
+        shapes.setColor(0.3f, 0.9f, 0.4f, 1f);
+        for (Enterable e : enterables) mapDot(px, py, s, e.bx, e.bz, 7f);
+        Vector3 ref = driving && currentCar != null ? currentCar.pos : pPos;
+        shapes.setColor(1f, 1f, 1f, 1f);
+        mapDot(px, py, s, ref.x, ref.z, 8f);
+        drawBtn(rMapClose, "TUTUP");
+        shapes.end();
+
+        batch.setProjectionMatrix(ortho);
+        batch.begin();
+        font.getData().setScale(2f);
+        font.setColor(Color.WHITE);
+        font.draw(batch, "PETA KOTA", px, py + ps + 30);
+        font.getData().setScale(1.5f);
+        font.draw(batch, "Putih=kamu  Biru=mobil parkir  Oranye=traffic", px + 10, py + ps - 12);
+        font.draw(batch, "Emas=koin  Hijau=gedung masuk", px + 10, py + ps - 36);
+        for (Enterable e : enterables) {
+            font.draw(batch, e.name, px + (e.bx + HALF) * s + 10, py + (HALF - e.bz) * s + 5);
+        }
+        drawBtnLabel(rMapClose, "TUTUP");
+        batch.end();
+        Gdx.gl.glEnable(GL20.GL_DEPTH_TEST);
+        Gdx.gl.glDisable(GL20.GL_BLEND);
+    }
+
+    private void setMapOpen(boolean open) {
+        mapOpen = open;
+        if (open && humId >= 0 && humSnd != null) { // pause: matikan hum mesin
+            humSnd.stop(humId);
+            humId = -1;
+        }
+        tapSound();
+    }
+
+    /** Label tombol MASUK/KELUAR, atau null bila tombol disembunyikan. */
+    private String enterLabel() {
+        if (driving) return null;
+        if (inInterior) return nearExitDoor() ? "KELUAR" : null;
+        if (nearestCar() != null) return "MASUK MOBIL";
+        Enterable nd = nearestDoor();
+        return nd != null ? "MASUK " + nd.name : null;
+    }
+
+    private Enterable nearestDoor() {
+        Enterable best = null;
+        float bestD = 2.5f * 2.5f;
+        for (Enterable e : enterables) {
+            float dx = e.door.x - pPos.x, dz = e.door.z - pPos.z;
+            float d2 = dx * dx + dz * dz;
+            if (d2 < bestD) {
+                bestD = d2;
+                best = e;
+            }
+        }
+        return best;
+    }
+
+    private boolean nearExitDoor() {
+        if (!inInterior) return false;
+        Room rm = rooms.get(curRoom);
+        float dx = rm.exitDoor.x - pPos.x, dz = rm.exitDoor.z - pPos.z;
+        return dx * dx + dz * dz < 2.5f * 2.5f;
+    }
+
+    private void enterInterior(Enterable e) {
+        curRoom = e.type;
+        curEnterable = e;
+        inInterior = true;
+        Room rm = rooms.get(curRoom);
+        pPos.set(rm.center.x, -60f, 0f);
+        pHeading = MathUtils.PI; // menghadap pintu keluar (dinding utara)
+        pVelY = 0f;
+        pOnGround = true;
+        camTargetS.set(pPos.x, pPos.y + 1.4f, pPos.z); // tanpa sapuan kamera
+        camDist = 4.5f; // ruangan kecil: kamera lebih dekat
+        tapSound();
+    }
+
+    private void exitInterior() {
+        inInterior = false;
+        pPos.set(curEnterable.door.x, 0f, curEnterable.door.z);
+        pHeading = 0f; // menghadap jalan
+        pVelY = 0f;
+        pOnGround = true;
+        camTargetS.set(pPos.x, pPos.y + 1.4f, pPos.z);
+        camDist = 8f;
+        tapSound();
     }
 
     /** Kotak tombol (rect y-down -> y-up). */
@@ -1085,6 +1592,17 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     @Override
     public boolean touchDown(int x, int y, int pointer, int button) {
+        // Tap minimap (pojok kanan atas; y-down: x [w-210, w-20], y [20, 210])
+        // = buka/tutup peta fullscreen. Tidak aktif saat di dalam gedung.
+        if (!inInterior && x >= Gdx.graphics.getWidth() - 210 && x <= Gdx.graphics.getWidth() - 20
+                && y >= 20 && y <= 210) {
+            setMapOpen(!mapOpen);
+            return true;
+        }
+        if (mapOpen) {
+            if (rMapClose.contains(x, y)) setMapOpen(false);
+            return true; // tap lain saat peta terbuka: abaikan
+        }
         if (rSound.contains(x, y)) {
             toggleSound();
             return true;
@@ -1114,8 +1632,15 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
                 tapSound();
                 return true;
             }
-            if (rEnter.contains(x, y) && nearestCar() != null) {
-                enterCar();
+            if (rEnter.contains(x, y)) {
+                if (inInterior) {
+                    if (nearExitDoor()) exitInterior();
+                } else if (nearestCar() != null) {
+                    enterCar();
+                } else {
+                    Enterable nd = nearestDoor();
+                    if (nd != null) enterInterior(nd);
+                }
                 return true;
             }
         }
@@ -1146,6 +1671,7 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     @Override
     public boolean touchDragged(int x, int y, int pointer) {
+        if (mapOpen) return true; // peta terbuka: drag dunia dinonaktifkan
         if (pointer == joyId) {
             updateJoy(x, y);
             return true;
@@ -1250,6 +1776,10 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
 
     @Override
     public boolean keyDown(int keycode) {
+        if ((keycode == Input.Keys.BACK || keycode == Input.Keys.ESCAPE) && mapOpen) {
+            setMapOpen(false);
+            return true;
+        }
         return false;
     }
 
