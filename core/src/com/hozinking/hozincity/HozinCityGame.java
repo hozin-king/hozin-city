@@ -35,10 +35,11 @@ import java.util.HashMap;
 import java.util.Random;
 
 /**
- * Hozin City v1.0.1 — mini open-world ala GTA SA (libGDX 3D).
+ * Hozin City v1.0.3 — mini open-world ala GTA SA (libGDX 3D).
  * Satu distrik kota: jalan kaki + nyetir + pejalan kaki + koin + minimap.
- * v1.0.1: kamera third-person diperbaiki total (smoothing + tanpa auto-follow
- * saat jalan kaki + arah drag pitch konvensi orbit + pinch halus + zoom 4-14).
+ * v1.0.3: arah setir DIPERBAIKI (dulu terbalik: joystick kanan = belok kiri;
+ * bukti vektor di updateCar). Audit semua pemetaan arah lain: jalan kaki,
+ * drag kamera yaw/pitch, pinch zoom, minimap, GAS/REM — semuanya SUDAH benar.
  * Optimasi: geometri statis digabung jadi sedikit mesh besar, satu directional
  * light + ambient, blob shadow murah (tanpa shadow map), fixed timestep 60 Hz,
  * frustum culling manual untuk objek dinamis, tanpa alokasi per-frame.
@@ -690,7 +691,16 @@ public class HozinCityGame extends ApplicationAdapter implements InputProcessor 
             c.speed -= c.speed * 0.6f * dt;
             if (Math.abs(c.speed) < 0.05f) c.speed = 0f;
         }
-        float steerTarget = joyX * 0.55f * (1f - Math.min(Math.abs(c.speed) / maxSpeed, 1f) * 0.55f);
+        // TANDA SETIR (v1.0.3 — BUG: dulu positif, TERBALIK di layar).
+        // Bukti: forward mobil F=(sin h, 0, cos h); kamera auto-center di
+        // belakang mobil (camYaw = h+pi) sehingga screen-right R=(-cos h, 0, sin h).
+        // heading += speed/2.9*tan(steer)*dt -> dF/dh=(cos h, 0, -sin h);
+        // dF . R = -(cos^2+sin^2) = -1 < 0 untuk steer>0 (joyX>0): mobil
+        // belok ke KIRI layar padahal joystick ke kanan. Saat mundur (speed<0)
+        // tandanya ikut terbalik (mundur harusnya ke kanan malah ke kiri).
+        // Perbaikan: negasikan steerTarget di sini (BUKAN heading) supaya
+        // visual roda depan (rotate Y sebesar steer) ikut benar arahnya.
+        float steerTarget = -joyX * 0.55f * (1f - Math.min(Math.abs(c.speed) / maxSpeed, 1f) * 0.55f);
         c.steer += (steerTarget - c.steer) * Math.min(1f, 8f * dt);
         c.heading += c.speed / 2.9f * (float) Math.tan(c.steer) * dt;
         float fx = MathUtils.sin(c.heading), fz = MathUtils.cos(c.heading);
